@@ -67,6 +67,8 @@ const sera = new MCPServerStdio({
     SERA_NETWORK: process.env.SERA_NETWORK ?? "mainnet",
     POLICY_PRESET: process.env.POLICY_PRESET ?? "standard",
     LOG_LEVEL: process.env.LOG_LEVEL ?? "warn",
+    SERA_ENABLE_EXECUTION_TOOLS: process.env.SERA_ENABLE_EXECUTION_TOOLS ?? "false",
+    SERA_SIGNER_MODE: "external",
     ...(process.env.SERA_API_KEY ? { SERA_API_KEY: process.env.SERA_API_KEY } : {}),
     ...(process.env.SERA_API_SECRET ? { SERA_API_SECRET: process.env.SERA_API_SECRET } : {}),
   },
@@ -96,6 +98,22 @@ Operating principles:
 
 let agent: Agent;
 let botUserId = "";
+
+// ─── EVENT DEDUPLICATION STORE ─────────────────────────────────────────────
+const seenEvents = new Map<string, number>();
+function isDuplicateEvent(eventId: string, maxSize = 1000, gcBatch = 200): boolean {
+  if (seenEvents.has(eventId)) {
+    return true;
+  }
+  if (seenEvents.size > maxSize) {
+    const sorted = [...seenEvents.entries()].sort((a, b) => a[1] - b[1]);
+    for (let i = 0; i < gcBatch; i++) {
+      seenEvents.delete(sorted[i][0]);
+    }
+  }
+  seenEvents.set(eventId, Date.now());
+  return false;
+}
 
 // ─── CONCURRENCY CONTROL INFRASTRUCTURE ──────────────────────────────────
 let activeRuns = 0;
@@ -134,10 +152,18 @@ async function handleSlackMessage(
     text?: string;
     user?: string;
   },
-  client: any
+  client: any,
+  body?: any
 ) {
   // Prevent response loops by ignoring bot messages or empty texts
   if (!event.text || !event.user || event.user === botUserId) {
+    return;
+  }
+
+  // Deduplicate events to prevent double processing on retries
+  const eventKey = body?.event_id || `${event.channel}:${event.ts}`;
+  if (isDuplicateEvent(eventKey)) {
+    console.log(`[slack_event] Ignoring duplicate event: ${eventKey}`);
     return;
   }
 
@@ -155,12 +181,35 @@ async function handleSlackMessage(
 
   if (fetchThreadTs) {
     try {
-      const replies = await client.conversations.replies({
+      let replies = await client.conversations.replies({
         channel: event.channel,
         ts: fetchThreadTs,
-        limit: 20, // Capped to reasonable size
+        limit: 100,
       });
       historyMessages = replies.messages ?? [];
+      let cursor = replies.response_metadata?.next_cursor;
+      while (cursor) {
+        const nextPage = await client.conversations.replies({
+          channel: event.channel,
+          ts: fetchThreadTs,
+          cursor: cursor,
+          limit: 100,
+        });
+        if (nextPage.messages) {
+          historyMessages.push(...nextPage.messages);
+        }
+        cursor = nextPage.response_metadata?.next_cursor;
+      }
+
+      // Ensure the current trigger event is represented in historyMessages
+      const hasCurrentEvent = historyMessages.some((msg) => msg.ts === event.ts);
+      if (!hasCurrentEvent) {
+        historyMessages.push(event);
+      }
+
+      if (historyMessages.length > 20) {
+        historyMessages = historyMessages.slice(-20);
+      }
     } catch (e) {
       process.stderr.write(`[slack_history_error] Failed to fetch thread context: ${String(e)}\n`);
       historyMessages = [event];
@@ -263,11 +312,12 @@ async function handleSlackMessage(
 
   // Success
   console.log(`[agent_execution_success] Completed in ${duration}ms.`);
+  const responseText = result.output?.trim() || "I'm sorry, I was unable to generate a response. Please try again.";
   try {
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: threadTs,
-      text: result.output,
+      text: responseText,
     });
   } catch (err) {
     process.stderr.write(`[slack_api_error] Failed to send agent response message: ${String(err)}\n`);
@@ -277,7 +327,7 @@ async function handleSlackMessage(
 // ─── REGISTER EVENT LISTENERS ─────────────────────────────────────────────
 
 // Handle Mentions (App mentions in channels)
-app.event("app_mention", async ({ event, client }) => {
+app.event("app_mention", async ({ event, client, body }) => {
   handleSlackMessage(
     {
       channel: event.channel,
@@ -286,14 +336,15 @@ app.event("app_mention", async ({ event, client }) => {
       text: event.text,
       user: event.user,
     },
-    client
+    client,
+    body
   ).catch((err) => {
     process.stderr.write(`[unhandled_app_mention_error] Exception in runner: ${String(err)}\n`);
   });
 });
 
 // Handle DMs (Direct messages to the Bot user)
-app.message(async ({ message, client }) => {
+app.message(async ({ message, client, body }) => {
   if (message.channel_type === "im") {
     handleSlackMessage(
       {
@@ -303,7 +354,8 @@ app.message(async ({ message, client }) => {
         text: (message as any).text,
         user: (message as any).user,
       },
-      client
+      client,
+      body
     ).catch((err) => {
       process.stderr.write(`[unhandled_dm_error] Exception in runner: ${String(err)}\n`);
     });
@@ -326,9 +378,13 @@ async function main() {
   try {
     const authTest = await app.client.auth.test();
     botUserId = authTest.user_id ?? "";
+    if (!botUserId) {
+      throw new Error("Slack auth.test did not return a user_id");
+    }
     console.log(`Slack bot authenticated successfully. User ID: ${botUserId}`);
   } catch (err) {
-    console.warn("Warning: Could not fetch Slack Bot User ID on startup.", err);
+    console.error("Fatal: Could not fetch Slack Bot User ID on startup.", err);
+    process.exit(1);
   }
 
   const transport = SLACK_SOCKET_MODE ? "Socket Mode" : "HTTP Events API";
