@@ -67,7 +67,7 @@ const sera = new MCPServerStdio({
     SERA_NETWORK: process.env.SERA_NETWORK ?? "mainnet",
     POLICY_PRESET: process.env.POLICY_PRESET ?? "standard",
     LOG_LEVEL: process.env.LOG_LEVEL ?? "warn",
-    SERA_ENABLE_EXECUTION_TOOLS: process.env.SERA_ENABLE_EXECUTION_TOOLS ?? "false",
+    SERA_ENABLE_EXECUTION_TOOLS: process.env.SERA_ENABLE_EXECUTION_TOOLS === "true" ? "true" : "false",
     SERA_SIGNER_MODE: "external",
     ...(process.env.SERA_API_KEY ? { SERA_API_KEY: process.env.SERA_API_KEY } : {}),
     ...(process.env.SERA_API_SECRET ? { SERA_API_SECRET: process.env.SERA_API_SECRET } : {}),
@@ -188,7 +188,8 @@ async function handleSlackMessage(
       });
       historyMessages = replies.messages ?? [];
       let cursor = replies.response_metadata?.next_cursor;
-      while (cursor) {
+      let pagesFetched = 1;
+      while (cursor && pagesFetched < 5) {
         const nextPage = await client.conversations.replies({
           channel: event.channel,
           ts: fetchThreadTs,
@@ -199,6 +200,7 @@ async function handleSlackMessage(
           historyMessages.push(...nextPage.messages);
         }
         cursor = nextPage.response_metadata?.next_cursor;
+        pagesFetched++;
       }
 
       // Ensure the current trigger event is represented in historyMessages
