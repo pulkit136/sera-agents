@@ -1,6 +1,6 @@
 # Template: discord-agent
 
-An educational starter template for a conversational Discord bot AI Agent built with the OpenAI Agents SDK and the Model Context Protocol (MCP) using `@openai/agents`. 
+An educational starter template for a conversational Discord bot AI Agent built with the OpenAI Agents SDK and the Model Context Protocol (MCP) using `@openai/agents`.
 
 This template provides a zero-dependency, stateless conversational reference implementation designed for team collaboration over the [Sera multi-currency settlement protocol](https://agents.sera.cx).
 
@@ -33,8 +33,8 @@ This template runs as a single Node.js process managing both the Discord Gateway
 └────────────────────────────────────────────────────────┘
 ```
 
-* **Authorization Boundaries:** Fail-closed allowlists for users, guilds, and channels. DMs disabled by default. When `SERA_API_KEY` or `SERA_API_SECRET` is set, at least one allowlist **must** be configured or the bot refuses to start.
-* **Stateless History Isolation:** Scopes conversations strictly to the context they occur in. In public channels, it filters out other users' messages **and** scopes bot replies using Discord message references to prevent cross-user context bleed. In DMs and Threads, it retrieves the full channel history dynamically (cached up to 15 messages) to operate without external database dependencies.
+* **Authorization Boundaries:** Fail-closed allowlists for users, guilds, and channels prevent unauthorized access to OpenAI quota and Sera credentials. At least one allowlist is required unconditionally (or `DISCORD_PUBLIC_MODE_ACK=true` to opt in to a public bot). DMs are disabled by default and require `DISCORD_ALLOWED_USER_IDS` when enabled.
+* **Stateless History Isolation:** Scopes conversations strictly to the context they occur in. In public channels and threads, it scopes bot replies using Discord message references to prevent cross-user context bleed, and filters thread history by the user authorization policy to prevent prompt injection. In DMs, it retrieves the channel history dynamically (cached up to 15 messages) to operate without external database dependencies.
 * **Mention Safety:** All bot replies suppress Discord mention parsing (`allowedMentions: { parse: [], repliedUser: false }`) to prevent LLM output from mentioning users, roles, or `@everyone`.
 * **Concurrency Slots:** Integrates an in-memory execution lock cap (defaulting to 4 concurrent runs) to manage CPU and LLM costs under heavy traffic.
 * **Embedded Financial Summaries:** Intercepts JSON payload wrappers from the agent response and converts them into scannable Discord Embeds (e.g. for quotes, settlement deals, or treasury holdings).
@@ -107,12 +107,15 @@ To connect this bot to Discord, navigate to the [Discord Developer Portal](https
 
 | Variable | Description | Default |
 |---|---|---|
-| `DISCORD_ALLOWED_USER_IDS` | Comma-separated Discord user IDs authorized to interact with the bot. If set, only these users can trigger the agent (fail-closed). | *None* (all users) |
+| `DISCORD_ALLOWED_USER_IDS` | Comma-separated Discord user IDs authorized to interact with the bot. If set, only these users can trigger the agent (fail-closed). **Required** when `DISCORD_ALLOW_DMS=true`. | *None* (all users) |
 | `DISCORD_ALLOWED_GUILD_IDS` | Comma-separated guild (server) IDs where the bot will respond. | *None* (all guilds) |
-| `DISCORD_ALLOWED_CHANNEL_IDS` | Comma-separated channel IDs where the bot will respond. | *None* (all channels) |
-| `DISCORD_ALLOW_DMS` | Set to `true` to enable Direct Messages. DMs still respect `DISCORD_ALLOWED_USER_IDS` if configured. | `false` |
+| `DISCORD_ALLOWED_CHANNEL_IDS` | Comma-separated channel IDs where the bot will respond. For threads, use the parent channel ID. | *None* (all channels) |
+| `DISCORD_ALLOW_DMS` | Set to `true` to enable Direct Messages. Requires `DISCORD_ALLOWED_USER_IDS` to also be set. | `false` |
+| `DISCORD_PUBLIC_MODE_ACK` | Set to `true` to explicitly acknowledge running without any allowlist (public bot). | `false` |
 
-> **⚠️ Important:** When `SERA_API_KEY` or `SERA_API_SECRET` is set, at least one allowlist (`DISCORD_ALLOWED_USER_IDS`, `DISCORD_ALLOWED_GUILD_IDS`, or `DISCORD_ALLOWED_CHANNEL_IDS`) **must** be configured. The bot will refuse to start without one, preventing unauthorized access to your Sera account.
+> **⚠️ Important:** At least one allowlist (`DISCORD_ALLOWED_USER_IDS`, `DISCORD_ALLOWED_GUILD_IDS`, or `DISCORD_ALLOWED_CHANNEL_IDS`) **must** be configured. Without one, any Discord user who can mention or DM the bot can consume the operator's OpenAI quota. If a fully public bot is intentional, set `DISCORD_PUBLIC_MODE_ACK=true` to acknowledge this.
+>
+> When `DISCORD_ALLOW_DMS=true`, `DISCORD_ALLOWED_USER_IDS` **must** also be set. Guild and channel allowlists cannot protect DM interactions.
 
 ### Optional
 
@@ -158,10 +161,11 @@ docker run --env-file .env sera-discord-bot
 
 ### Built-In Security Controls
 
-* **Authorization Boundaries:** Fail-closed allowlists for users, guilds, and channels prevent unauthorized access to the operator's Sera account and OpenAI quota.
-* **DMs Disabled by Default:** DMs must be explicitly opted into via `DISCORD_ALLOW_DMS=true`. When enabled, user allowlists still apply.
+* **Authorization Boundaries:** Fail-closed allowlists for users, guilds, and channels prevent unauthorized access to the operator's OpenAI quota and Sera account. At least one allowlist is required unless `DISCORD_PUBLIC_MODE_ACK=true` is set.
+* **DMs Disabled by Default:** DMs must be explicitly opted into via `DISCORD_ALLOW_DMS=true` **and** require `DISCORD_ALLOWED_USER_IDS` to be set. Guild/channel allowlists cannot protect DM interactions.
 * **Mention Safety:** All bot replies suppress Discord mention parsing. LLM output cannot ping users, roles, or `@everyone`.
-* **History Isolation:** Bot responses in public channels are scoped by Discord message references, preventing cross-user context bleed.
+* **History Isolation:** Bot responses in public channels and threads are scoped by Discord message references, preventing cross-user context bleed. Thread history filters messages from unauthorized authors against the user allowlist, preventing prompt injection via planted instructions.
+* **Thread Channel Resolution:** Channel allowlists use the parent channel ID for threads, so threads under an allowed channel are permitted without individually listing each thread.
 * **Execution Tools Disabled:** `SERA_ENABLE_EXECUTION_TOOLS=false` is pinned in the subprocess environment.
 * **External Signer Mode:** `SERA_SIGNER_MODE=external` is pinned — no private keys are held by the bot process.
 
@@ -182,15 +186,15 @@ docker run --env-file .env sera-discord-bot
 
 ## 7. Troubleshooting & Limitations
 
-* **Bot reads blank strings / ignores mentions:** 
-  * *Cause:* The **Message Content Intent** is disabled in the Discord Portal. 
+* **Bot reads blank strings / ignores mentions:**
+  * *Cause:* The **Message Content Intent** is disabled in the Discord Portal.
   * *Resolution:* Re-visit the portal, check the Message Content toggle under the Bot tab, save changes, and restart the bot.
-* **Command registration lag:** 
-  * *Cause:* Global Slash Command registrations are cached and can take up to an hour to populate. 
+* **Command registration lag:**
+  * *Cause:* Global Slash Command registrations are cached and can take up to an hour to populate.
   * *Resolution:* Define `DISCORD_GUILD_ID` in your `.env` during local testing to bind the `/help` command instantly to your test server.
-* **Permission Errors (`DiscordAPIError[50013]`):** 
-  * *Cause:* The bot role is missing permission to post in specific threads or read channel histories. 
+* **Permission Errors (`DiscordAPIError[50013]`):**
+  * *Cause:* The bot role is missing permission to post in specific threads or read channel histories.
   * *Resolution:* Regenerate the invite link with the exact scopes specified in the portal setup section above.
 * **Bot refuses to start with allowlist error:**
-  * *Cause:* `SERA_API_KEY` or `SERA_API_SECRET` is set without any authorization allowlist.
-  * *Resolution:* Configure at least one of `DISCORD_ALLOWED_USER_IDS`, `DISCORD_ALLOWED_GUILD_IDS`, or `DISCORD_ALLOWED_CHANNEL_IDS`.
+  * *Cause:* No authorization allowlist configured (or `DISCORD_ALLOW_DMS=true` without `DISCORD_ALLOWED_USER_IDS`).
+  * *Resolution:* Configure at least one of `DISCORD_ALLOWED_USER_IDS`, `DISCORD_ALLOWED_GUILD_IDS`, or `DISCORD_ALLOWED_CHANNEL_IDS`. If DMs are enabled, `DISCORD_ALLOWED_USER_IDS` is required. Alternatively, set `DISCORD_PUBLIC_MODE_ACK=true` if public access is intentional.

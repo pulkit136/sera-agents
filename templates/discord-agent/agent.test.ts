@@ -13,11 +13,16 @@ import {
   type AuthContext,
   checkAuthorization,
   evictStaleRateLimits,
+  isAuthorAuthorized,
   isRateLimited,
   logEvent,
   parseAllowlist,
   parseMaxConcurrent,
+  rateLimits,
+  SAFE_REPLY_OPTIONS,
+  safeReply,
   splitMessage,
+  toSafeReplyOptions,
   tryFormatEmbed,
 } from "./agent.js";
 
@@ -62,51 +67,54 @@ describe("parseAllowlist", () => {
 });
 
 describe("checkAuthorization", () => {
+  const baseConfig: AuthConfig = {
+    allowedUsers: null,
+    allowedGuilds: null,
+    allowedChannels: null,
+    allowDMs: false,
+    publicModeAck: false,
+  };
+
   const baseCtx: AuthContext = {
     userId: "user1",
     guildId: "guild1",
     channelId: "chan1",
+    parentChannelId: null,
     isDM: false,
   };
 
-  it("allows all when no allowlists are configured and DMs are disabled (guild message)", () => {
-    const config: AuthConfig = {
-      allowedUsers: null,
-      allowedGuilds: null,
-      allowedChannels: null,
-      allowDMs: false,
-    };
-    assert.equal(checkAuthorization(config, baseCtx), null);
+  it("allows all when no allowlists are configured (guild message)", () => {
+    assert.equal(checkAuthorization(baseConfig, baseCtx), null);
   });
 
   it("denies DMs when allowDMs is false", () => {
-    const config: AuthConfig = {
-      allowedUsers: null,
-      allowedGuilds: null,
-      allowedChannels: null,
-      allowDMs: false,
-    };
     const ctx: AuthContext = { ...baseCtx, isDM: true, guildId: null };
-    assert.equal(checkAuthorization(config, ctx), "dm_disabled");
+    assert.equal(checkAuthorization(baseConfig, ctx), "dm_disabled");
   });
 
-  it("allows DMs when allowDMs is true and no user allowlist", () => {
+  // ── DM authorization gap fix ──
+
+  it("denies DMs when allowDMs is true but no user allowlist is configured", () => {
+    const config: AuthConfig = { ...baseConfig, allowDMs: true };
+    const ctx: AuthContext = { ...baseCtx, isDM: true, guildId: null };
+    assert.equal(checkAuthorization(config, ctx), "dm_requires_user_allowlist");
+  });
+
+  it("denies DMs when allowDMs is true and only guild allowlist is configured (no user allowlist)", () => {
     const config: AuthConfig = {
-      allowedUsers: null,
-      allowedGuilds: null,
-      allowedChannels: null,
+      ...baseConfig,
       allowDMs: true,
+      allowedGuilds: new Set(["guild1"]),
     };
     const ctx: AuthContext = { ...baseCtx, isDM: true, guildId: null };
-    assert.equal(checkAuthorization(config, ctx), null);
+    assert.equal(checkAuthorization(config, ctx), "dm_requires_user_allowlist");
   });
 
-  it("allows DMs for allowlisted user", () => {
+  it("allows DMs for allowlisted user when user allowlist is configured", () => {
     const config: AuthConfig = {
+      ...baseConfig,
+      allowDMs: true,
       allowedUsers: new Set(["user1"]),
-      allowedGuilds: null,
-      allowedChannels: null,
-      allowDMs: true,
     };
     const ctx: AuthContext = { ...baseCtx, isDM: true, guildId: null };
     assert.equal(checkAuthorization(config, ctx), null);
@@ -114,83 +122,119 @@ describe("checkAuthorization", () => {
 
   it("denies DMs for non-allowlisted user", () => {
     const config: AuthConfig = {
-      allowedUsers: new Set(["otherUser"]),
-      allowedGuilds: null,
-      allowedChannels: null,
+      ...baseConfig,
       allowDMs: true,
+      allowedUsers: new Set(["otherUser"]),
     };
-    const ctx: AuthContext = { userId: "user1", isDM: true, guildId: null, channelId: "dm1" };
+    const ctx: AuthContext = {
+      userId: "user1",
+      isDM: true,
+      guildId: null,
+      channelId: "dm1",
+      parentChannelId: null,
+    };
     assert.equal(checkAuthorization(config, ctx), "user_not_allowed");
   });
 
+  // ── Guild authorization ──
+
   it("denies guild messages for non-allowlisted guild", () => {
-    const config: AuthConfig = {
-      allowedUsers: null,
-      allowedGuilds: new Set(["allowedGuild"]),
-      allowedChannels: null,
-      allowDMs: false,
-    };
+    const config: AuthConfig = { ...baseConfig, allowedGuilds: new Set(["allowedGuild"]) };
     assert.equal(checkAuthorization(config, baseCtx), "guild_not_allowed");
   });
 
   it("allows guild messages for allowlisted guild", () => {
-    const config: AuthConfig = {
-      allowedUsers: null,
-      allowedGuilds: new Set(["guild1"]),
-      allowedChannels: null,
-      allowDMs: false,
-    };
+    const config: AuthConfig = { ...baseConfig, allowedGuilds: new Set(["guild1"]) };
     assert.equal(checkAuthorization(config, baseCtx), null);
   });
 
+  // ── Channel authorization ──
+
   it("denies guild messages for non-allowlisted channel", () => {
-    const config: AuthConfig = {
-      allowedUsers: null,
-      allowedGuilds: null,
-      allowedChannels: new Set(["allowedChan"]),
-      allowDMs: false,
-    };
+    const config: AuthConfig = { ...baseConfig, allowedChannels: new Set(["allowedChan"]) };
     assert.equal(checkAuthorization(config, baseCtx), "channel_not_allowed");
   });
 
   it("allows guild messages for allowlisted channel", () => {
-    const config: AuthConfig = {
-      allowedUsers: null,
-      allowedGuilds: null,
-      allowedChannels: new Set(["chan1"]),
-      allowDMs: false,
-    };
+    const config: AuthConfig = { ...baseConfig, allowedChannels: new Set(["chan1"]) };
     assert.equal(checkAuthorization(config, baseCtx), null);
   });
 
-  it("denies guild messages for non-allowlisted user when user allowlist is set", () => {
-    const config: AuthConfig = {
-      allowedUsers: new Set(["otherUser"]),
-      allowedGuilds: null,
-      allowedChannels: null,
-      allowDMs: false,
+  // ── Thread channel resolution ──
+
+  it("allows thread when parent channel is in the channel allowlist", () => {
+    const config: AuthConfig = { ...baseConfig, allowedChannels: new Set(["parent-chan"]) };
+    const ctx: AuthContext = {
+      ...baseCtx,
+      channelId: "thread-123",
+      parentChannelId: "parent-chan",
     };
+    assert.equal(checkAuthorization(config, ctx), null);
+  });
+
+  it("denies thread when parent channel is not in the channel allowlist", () => {
+    const config: AuthConfig = { ...baseConfig, allowedChannels: new Set(["other-chan"]) };
+    const ctx: AuthContext = {
+      ...baseCtx,
+      channelId: "thread-123",
+      parentChannelId: "parent-chan",
+    };
+    assert.equal(checkAuthorization(config, ctx), "channel_not_allowed");
+  });
+
+  // ── User authorization ──
+
+  it("denies guild messages for non-allowlisted user when user allowlist is set", () => {
+    const config: AuthConfig = { ...baseConfig, allowedUsers: new Set(["otherUser"]) };
     assert.equal(checkAuthorization(config, baseCtx), "user_not_allowed");
   });
 
+  // ── Combined allowlists ──
+
   it("enforces all three allowlists together — pass", () => {
     const config: AuthConfig = {
+      ...baseConfig,
       allowedUsers: new Set(["user1"]),
       allowedGuilds: new Set(["guild1"]),
       allowedChannels: new Set(["chan1"]),
-      allowDMs: false,
     };
     assert.equal(checkAuthorization(config, baseCtx), null);
   });
 
   it("enforces all three allowlists together — guild fail", () => {
     const config: AuthConfig = {
+      ...baseConfig,
       allowedUsers: new Set(["user1"]),
       allowedGuilds: new Set(["otherGuild"]),
       allowedChannels: new Set(["chan1"]),
-      allowDMs: false,
     };
     assert.equal(checkAuthorization(config, baseCtx), "guild_not_allowed");
+  });
+});
+
+// ── History Author Authorization Tests ───────────────────────────────────────
+
+describe("isAuthorAuthorized", () => {
+  const baseConfig: AuthConfig = {
+    allowedUsers: null,
+    allowedGuilds: null,
+    allowedChannels: null,
+    allowDMs: false,
+    publicModeAck: false,
+  };
+
+  it("allows any author when no user allowlist is configured", () => {
+    assert.equal(isAuthorAuthorized(baseConfig, "random-user"), true);
+  });
+
+  it("allows an author on the user allowlist", () => {
+    const config: AuthConfig = { ...baseConfig, allowedUsers: new Set(["user1"]) };
+    assert.equal(isAuthorAuthorized(config, "user1"), true);
+  });
+
+  it("denies an author not on the user allowlist", () => {
+    const config: AuthConfig = { ...baseConfig, allowedUsers: new Set(["user1"]) };
+    assert.equal(isAuthorAuthorized(config, "attacker"), false);
   });
 });
 
@@ -218,16 +262,27 @@ describe("isRateLimited", () => {
 });
 
 describe("evictStaleRateLimits", () => {
-  it("evicts entries older than the rate-limit window", () => {
-    // Prime a user then manually backdate the entry
-    isRateLimited("stale-user");
-    // Access the internal map through the exported function behavior:
-    // We can't directly manipulate the map from outside, but we can verify
-    // that eviction works after the window expires by checking that the user
-    // is no longer rate-limited after eviction + new request
+  it("does not evict fresh entries", () => {
+    const userId = "fresh-user-evict-test";
+    isRateLimited(userId);
     const evicted = evictStaleRateLimits();
-    // All recently-created entries should NOT be evicted (they're fresh)
+    // The entry we just created should NOT be evicted
+    assert.ok(rateLimits.has(userId), "Fresh entry should not be evicted");
     assert.equal(typeof evicted, "number");
+  });
+
+  it("evicts entries that have been backdated past the window", () => {
+    const userId = "stale-user-evict-test";
+    // Create a rate-limit entry, then manually backdate it
+    isRateLimited(userId);
+    const entry = rateLimits.get(userId);
+    assert.ok(entry, "Entry should exist");
+    // Backdate to 2 minutes ago (window is 60s)
+    entry.start = Date.now() - 120_000;
+
+    const evicted = evictStaleRateLimits();
+    assert.ok(evicted >= 1, "At least one stale entry should be evicted");
+    assert.ok(!rateLimits.has(userId), "Stale entry should have been removed");
   });
 });
 
@@ -347,14 +402,51 @@ describe("tryFormatEmbed", () => {
 // ── Mention Safety Tests ─────────────────────────────────────────────────────
 
 describe("mention safety", () => {
-  it("SAFE_REPLY_OPTIONS constant is importable and correctly structured", async () => {
-    // We verify the constant exists in the module by importing it.
-    // Since it's not directly exported, we verify the pattern through the code structure.
-    // The key safety guarantee is verified by the integration of safeReply() in all reply paths.
-    // This test validates that the approach is correct.
-    const expectedOptions = { allowedMentions: { parse: [], repliedUser: false } };
-    assert.deepEqual(expectedOptions.allowedMentions.parse, []);
-    assert.equal(expectedOptions.allowedMentions.repliedUser, false);
+  it("SAFE_REPLY_OPTIONS has empty parse array", () => {
+    assert.deepEqual(SAFE_REPLY_OPTIONS.allowedMentions?.parse, []);
+  });
+
+  it("SAFE_REPLY_OPTIONS disables repliedUser mention", () => {
+    assert.equal(SAFE_REPLY_OPTIONS.allowedMentions?.repliedUser, false);
+  });
+
+  it("SAFE_REPLY_OPTIONS is deeply structured correctly", () => {
+    assert.deepEqual(SAFE_REPLY_OPTIONS, {
+      allowedMentions: { parse: [], repliedUser: false },
+    });
+  });
+
+  it("toSafeReplyOptions wraps string content with SAFE_REPLY_OPTIONS", () => {
+    const opts = toSafeReplyOptions("Hello @everyone");
+    assert.equal(opts.content, "Hello @everyone");
+    assert.deepEqual(opts.allowedMentions, { parse: [], repliedUser: false });
+  });
+
+  it("toSafeReplyOptions overrides malicious allowedMentions in object content", () => {
+    const maliciousPayload = {
+      content: "Hello @everyone",
+      allowedMentions: { parse: ["everyone" as const, "roles" as const, "users" as const] },
+    };
+    const opts = toSafeReplyOptions(maliciousPayload);
+    assert.equal(opts.content, "Hello @everyone");
+    // Ensure SAFE_REPLY_OPTIONS overrides the malicious allowedMentions
+    assert.deepEqual(opts.allowedMentions, { parse: [], repliedUser: false });
+  });
+
+  it("safeReply passes SAFE_REPLY_OPTIONS to message.reply() mock", async () => {
+    let capturedOptions: unknown = null;
+    const mockMessage = {
+      reply: async (options: unknown) => {
+        capturedOptions = options;
+        return { id: "mock-reply-1" };
+      },
+    };
+
+    await safeReply(mockMessage, "Test message");
+    assert.deepEqual(capturedOptions, {
+      content: "Test message",
+      allowedMentions: { parse: [], repliedUser: false },
+    });
   });
 });
 

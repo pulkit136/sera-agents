@@ -14,7 +14,6 @@ import {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
-  type Message,
   type MessageReplyOptions,
   Partials,
   type TextBasedChannel,
@@ -52,9 +51,25 @@ const JSON_BLOCK_REGEX = /```json\s*([\s\S]*?)\s*```/;
 let mentionRegex: RegExp;
 
 /** Safe reply options that suppress all Discord mentions from LLM output. */
-const SAFE_REPLY_OPTIONS: Pick<MessageReplyOptions, "allowedMentions"> = {
+export const SAFE_REPLY_OPTIONS: Pick<MessageReplyOptions, "allowedMentions"> = {
   allowedMentions: { parse: [], repliedUser: false },
 };
+
+/** Build reply options that strictly suppress all mention parsing. */
+export function toSafeReplyOptions(content: string | MessageReplyOptions): MessageReplyOptions {
+  if (typeof content === "string") {
+    return { content, ...SAFE_REPLY_OPTIONS };
+  }
+  return { ...content, ...SAFE_REPLY_OPTIONS };
+}
+
+/** Send a safe reply that suppresses all mention parsing. */
+export async function safeReply(
+  message: { reply: (options: MessageReplyOptions) => Promise<unknown> },
+  content: string | MessageReplyOptions,
+): Promise<unknown> {
+  return message.reply(toSafeReplyOptions(content));
+}
 
 // ── 3. AUTHORIZATION BOUNDARIES ──────────────────────────────────────────────
 
@@ -76,6 +91,7 @@ export interface AuthConfig {
   allowedGuilds: Set<string> | null;
   allowedChannels: Set<string> | null;
   allowDMs: boolean;
+  publicModeAck: boolean;
 }
 
 export function loadAuthConfig(): AuthConfig {
@@ -84,6 +100,7 @@ export function loadAuthConfig(): AuthConfig {
     allowedGuilds: parseAllowlist(process.env.DISCORD_ALLOWED_GUILD_IDS),
     allowedChannels: parseAllowlist(process.env.DISCORD_ALLOWED_CHANNEL_IDS),
     allowDMs: process.env.DISCORD_ALLOW_DMS === "true",
+    publicModeAck: process.env.DISCORD_PUBLIC_MODE_ACK === "true",
   };
 }
 
@@ -91,6 +108,8 @@ export interface AuthContext {
   userId: string;
   guildId: string | null;
   channelId: string;
+  /** For threads, the parent channel ID; otherwise same as channelId. */
+  parentChannelId: string | null;
   isDM: boolean;
 }
 
@@ -104,8 +123,11 @@ export function checkAuthorization(config: AuthConfig, ctx: AuthContext): string
     if (!config.allowDMs) {
       return "dm_disabled";
     }
-    // In DMs, only check user allowlist (no guild/channel to check)
-    if (config.allowedUsers && !config.allowedUsers.has(ctx.userId)) {
+    // DMs always require a user allowlist — guild/channel allowlists cannot protect DMs
+    if (!config.allowedUsers) {
+      return "dm_requires_user_allowlist";
+    }
+    if (!config.allowedUsers.has(ctx.userId)) {
       return "user_not_allowed";
     }
     return null;
@@ -116,9 +138,12 @@ export function checkAuthorization(config: AuthConfig, ctx: AuthContext): string
     return "guild_not_allowed";
   }
 
-  // Channel authorization
-  if (config.allowedChannels && !config.allowedChannels.has(ctx.channelId)) {
-    return "channel_not_allowed";
+  // Channel authorization — for threads, check the parent channel ID
+  if (config.allowedChannels) {
+    const effectiveChannelId = ctx.parentChannelId ?? ctx.channelId;
+    if (!config.allowedChannels.has(effectiveChannelId)) {
+      return "channel_not_allowed";
+    }
   }
 
   // User authorization
@@ -129,8 +154,18 @@ export function checkAuthorization(config: AuthConfig, ctx: AuthContext): string
   return null;
 }
 
+/**
+ * Check whether a historical message author is authorized to have their
+ * content included in the agent context. Used to filter thread/channel
+ * history to prevent unauthorized users from injecting context.
+ */
+export function isAuthorAuthorized(config: AuthConfig, authorId: string): boolean {
+  if (!config.allowedUsers) return true;
+  return config.allowedUsers.has(authorId);
+}
+
 // ── 4. IN-MEMORY RATE LIMITING ───────────────────────────────────────────────
-const rateLimits = new Map<string, { count: number; start: number }>();
+export const rateLimits = new Map<string, { count: number; start: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
 /** Interval between stale-entry eviction sweeps. */
@@ -327,19 +362,34 @@ async function main() {
   // Load authorization config
   const authConfig = loadAuthConfig();
 
-  // Require at least one authorization boundary when Sera API credentials are present
-  const hasApiCredentials = !!(process.env.SERA_API_KEY || process.env.SERA_API_SECRET);
+  // Require at least one authorization boundary unconditionally.
+  // Without an allowlist, any Discord user who can mention or DM the bot can
+  // consume the operator's OpenAI quota and (if configured) Sera API resources.
+  // Operators who intentionally want a public bot must opt in explicitly.
   const hasAnyAllowlist =
     authConfig.allowedUsers !== null ||
     authConfig.allowedGuilds !== null ||
     authConfig.allowedChannels !== null;
 
-  if (hasApiCredentials && !hasAnyAllowlist) {
+  if (!hasAnyAllowlist && !authConfig.publicModeAck) {
     logEvent("startup_failed", {
       reason:
-        "SERA_API_KEY or SERA_API_SECRET is set but no authorization allowlist is configured. " +
-        "Set at least one of DISCORD_ALLOWED_USER_IDS, DISCORD_ALLOWED_GUILD_IDS, or " +
-        "DISCORD_ALLOWED_CHANNEL_IDS to restrict access to your Sera account.",
+        "No authorization allowlist is configured. Any Discord user who can mention or DM " +
+        "the bot can consume the operator's OpenAI quota. Set at least one of " +
+        "DISCORD_ALLOWED_USER_IDS, DISCORD_ALLOWED_GUILD_IDS, or DISCORD_ALLOWED_CHANNEL_IDS " +
+        "to restrict access. If a fully public bot is intentional, set " +
+        "DISCORD_PUBLIC_MODE_ACK=true to acknowledge this.",
+    });
+    process.exit(1);
+  }
+
+  // When DMs are enabled, a user allowlist is mandatory to prevent any
+  // Discord user from privately consuming resources.
+  if (authConfig.allowDMs && !authConfig.allowedUsers) {
+    logEvent("startup_failed", {
+      reason:
+        "DISCORD_ALLOW_DMS=true requires DISCORD_ALLOWED_USER_IDS to be set. " +
+        "Guild and channel allowlists cannot protect DM interactions.",
     });
     process.exit(1);
   }
@@ -412,6 +462,7 @@ async function main() {
     channel: TextBasedChannel,
     authorId: string,
     botUserId: string,
+    historyAuthConfig: AuthConfig,
     limit = 15,
     excludeMessageId?: string,
   ): Promise<Array<ReturnType<typeof user> | ReturnType<typeof assistant>>> {
@@ -438,8 +489,8 @@ async function main() {
         if (msg.author.bot) {
           if (msg.author.id === botUserId) {
             // Only include bot messages that were direct replies to the current user.
-            // This prevents cross-user context bleed in public channels.
-            if (!isDM && !isThread) {
+            // This prevents cross-user context bleed in public channels and threads.
+            if (!isDM) {
               const replyToId = msg.reference?.messageId;
               if (!replyToId || !currentUserMessageIds.has(replyToId)) {
                 continue;
@@ -461,9 +512,20 @@ async function main() {
             }
           }
         } else {
-          // Context rules: normal channels only load messages from the specific participant
-          if (!isDM && !isThread && msg.author.id !== authorId) {
-            continue;
+          // In DMs, include all user messages. In channels and threads,
+          // only include messages from the invoking user. Additionally,
+          // in threads, validate that non-self authors pass the authorization
+          // policy to prevent unauthorized users from injecting context.
+          if (!isDM) {
+            if (msg.author.id !== authorId) {
+              continue;
+            }
+            // Even for the invoking user's own messages in threads,
+            // verify they pass the user allowlist (they should, since
+            // we already checked the invoking user, but defense-in-depth)
+            if (isThread && !isAuthorAuthorized(historyAuthConfig, msg.author.id)) {
+              continue;
+            }
           }
 
           const cleanText = msg.content.replace(mentionRegex, "").trim();
@@ -478,17 +540,6 @@ async function main() {
       logEvent("history_fetch_failed", { error: errorMsg });
       return [];
     }
-  }
-
-  /** Send a safe reply that suppresses all mention parsing. */
-  async function safeReply(
-    message: Message,
-    content: string | MessageReplyOptions,
-  ): Promise<Message> {
-    if (typeof content === "string") {
-      return message.reply({ content, ...SAFE_REPLY_OPTIONS });
-    }
-    return message.reply({ ...content, ...SAFE_REPLY_OPTIONS });
   }
 
   // Gateway Ready Handlers
@@ -555,10 +606,16 @@ async function main() {
 
     if (!isDM && !isMentioned) return;
 
+    // For threads, resolve the parent channel ID so channel allowlists
+    // apply to the parent channel rather than the thread ID.
+    const parentChannelId =
+      !isDM && message.channel.isThread() ? (message.channel.parentId ?? null) : null;
+
     const authCtx: AuthContext = {
       userId: message.author.id,
       guildId: message.guildId,
       channelId: message.channel.id,
+      parentChannelId,
       isDM,
     };
 
@@ -623,6 +680,7 @@ async function main() {
           message.channel,
           message.author.id,
           botUserId,
+          authConfig,
           15,
           message.id,
         );
