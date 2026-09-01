@@ -8,7 +8,7 @@ This template provides a zero-dependency, stateless conversational reference imp
 
 ## 1. Architecture Overview
 
-This template runs as a single Node.js process managing both the Discord Gateway client and the local AI Agent executor.
+This template runs as a single Node.js process managing both the Discord Gateway client and the local AI Agent executor. The MCP transport is **stdio-only** (`SERA_MCP_DIST` is required; `SERA_MCP_URL` is not supported by this template).
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -22,6 +22,7 @@ This template runs as a single Node.js process managing both the Discord Gateway
 │  - Discord Client (discord.js v14)                     │
 │  - OpenAI Agent Run Loop (openai/agents SDK)           │
 │  - Child Subprocess Stdio Bridge (MCPServerStdio)      │
+│  - Authorization Boundaries (user/guild/channel)       │
 │  - In-Memory Concurrency Control & Rate Limiter       │
 └──────────────────────────┬─────────────────────────────┘
                            │ stdio
@@ -32,7 +33,9 @@ This template runs as a single Node.js process managing both the Discord Gateway
 └────────────────────────────────────────────────────────┘
 ```
 
-* **Stateless History Isolation:** Scopes conversations strictly to the context they occur in. In public channels, it fetches history dynamically but filters out other users' messages to avoid context bleed or prompt injection vectors. In DMs and Threads, it retrieves the full channel history dynamically (cached up to 15 messages) to operate without external database dependencies.
+* **Authorization Boundaries:** Fail-closed allowlists for users, guilds, and channels. DMs disabled by default. When `SERA_API_KEY` or `SERA_API_SECRET` is set, at least one allowlist **must** be configured or the bot refuses to start.
+* **Stateless History Isolation:** Scopes conversations strictly to the context they occur in. In public channels, it filters out other users' messages **and** scopes bot replies using Discord message references to prevent cross-user context bleed. In DMs and Threads, it retrieves the full channel history dynamically (cached up to 15 messages) to operate without external database dependencies.
+* **Mention Safety:** All bot replies suppress Discord mention parsing (`allowedMentions: { parse: [], repliedUser: false }`) to prevent LLM output from mentioning users, roles, or `@everyone`.
 * **Concurrency Slots:** Integrates an in-memory execution lock cap (defaulting to 4 concurrent runs) to manage CPU and LLM costs under heavy traffic.
 * **Embedded Financial Summaries:** Intercepts JSON payload wrappers from the agent response and converts them into scannable Discord Embeds (e.g. for quotes, settlement deals, or treasury holdings).
 
@@ -81,9 +84,9 @@ To connect this bot to Discord, navigate to the [Discord Developer Portal](https
    cp .env.example .env
    ```
 
-3. Populate the required keys (see **Environment Variables** below). For instant command registration testing on a dev server, specify `DISCORD_GUILD_ID`.
+3. Populate the required keys (see **Environment Variables** below). Configure authorization boundaries — at minimum, set `DISCORD_ALLOWED_USER_IDS` to restrict which Discord users can interact with the bot. For instant command registration testing on a dev server, specify `DISCORD_GUILD_ID`.
 
-4. Start the bot:
+4. Start the bot (`.env` is loaded automatically via `dotenv`):
    ```bash
    npm start
    ```
@@ -92,17 +95,35 @@ To connect this bot to Discord, navigate to the [Discord Developer Portal](https
 
 ## 4. Environment Variables
 
-| Variable | Requirement | Description | Default |
-|---|---|---|---|
-| `DISCORD_TOKEN` | **Required** | The Discord Bot user token from the developer portal. | *None* |
-| `OPENAI_API_KEY` | **Required** | OpenAI API key for LLM reasoning and agent loops. | *None* |
-| `SERA_MCP_DIST` | **Required** | Custom absolute path to the built compilation of `sera-mcp` (e.g. `/absolute/path/to/sera-mcp/dist/index.js`). | *None* |
-| `DISCORD_GUILD_ID` | Optional | Dev server ID. Bypasses Discord's 1-hour global slash command caching for instant local registration. | *None* |
-| `DISCORD_MAX_CONCURRENT` | Optional | Maximum concurrent agent loops allowed at any given time. | `4` |
-| `SERA_NETWORK` | Optional | Specifies the Sera network path. Set to `mainnet` or `testnet`. | `mainnet` |
-| `POLICY_PRESET` | Optional | MCP execution policy parameters. | `standard` |
-| `SERA_API_KEY` | Optional | Required to unlock actual treasury execution and conversions. | *None* |
-| `SERA_API_SECRET` | Optional | Companion credential for signing live settlement intents. | *None* |
+### Required
+
+| Variable | Description | Default |
+|---|---|---|
+| `DISCORD_TOKEN` | The Discord Bot user token from the developer portal. | *None* |
+| `OPENAI_API_KEY` | OpenAI API key for LLM reasoning and agent loops. | *None* |
+| `SERA_MCP_DIST` | Custom absolute path to the built compilation of `sera-mcp` (e.g. `/absolute/path/to/sera-mcp/dist/index.js`). | *None* |
+
+### Authorization Boundaries
+
+| Variable | Description | Default |
+|---|---|---|
+| `DISCORD_ALLOWED_USER_IDS` | Comma-separated Discord user IDs authorized to interact with the bot. If set, only these users can trigger the agent (fail-closed). | *None* (all users) |
+| `DISCORD_ALLOWED_GUILD_IDS` | Comma-separated guild (server) IDs where the bot will respond. | *None* (all guilds) |
+| `DISCORD_ALLOWED_CHANNEL_IDS` | Comma-separated channel IDs where the bot will respond. | *None* (all channels) |
+| `DISCORD_ALLOW_DMS` | Set to `true` to enable Direct Messages. DMs still respect `DISCORD_ALLOWED_USER_IDS` if configured. | `false` |
+
+> **⚠️ Important:** When `SERA_API_KEY` or `SERA_API_SECRET` is set, at least one allowlist (`DISCORD_ALLOWED_USER_IDS`, `DISCORD_ALLOWED_GUILD_IDS`, or `DISCORD_ALLOWED_CHANNEL_IDS`) **must** be configured. The bot will refuse to start without one, preventing unauthorized access to your Sera account.
+
+### Optional
+
+| Variable | Description | Default |
+|---|---|---|
+| `DISCORD_GUILD_ID` | Dev server ID. Bypasses Discord's 1-hour global slash command caching for instant local registration. | *None* |
+| `DISCORD_MAX_CONCURRENT` | Maximum concurrent agent loops allowed at any given time. Must be a positive integer; invalid values fall back to the default. | `4` |
+| `SERA_NETWORK` | Specifies the Sera network path. Set to `mainnet` or `testnet`. | `mainnet` |
+| `POLICY_PRESET` | MCP execution policy parameters. | `standard` |
+| `SERA_API_KEY` | Required to unlock actual treasury execution and conversions. | *None* |
+| `SERA_API_SECRET` | Companion credential for signing live settlement intents. | *None* |
 
 ---
 
@@ -111,7 +132,7 @@ To connect this bot to Discord, navigate to the [Discord Developer Portal](https
 ### Option A: Railway
 1. Link your Git repository.
 2. In the Railway dashboard, create a new service from the repository.
-3. Add the required environment variables (`DISCORD_TOKEN`, `OPENAI_API_KEY`, `SERA_MCP_DIST`).
+3. Add the required environment variables (`DISCORD_TOKEN`, `OPENAI_API_KEY`, `SERA_MCP_DIST`) and authorization boundaries.
 4. Click deploy. Because the bot establishes an outbound WebSocket gateway connection, **no port exposure, reverse proxy, or TLS setups are required**.
 
 ### Option B: Docker
@@ -135,7 +156,22 @@ docker run --env-file .env sera-discord-bot
 
 ## 6. Security Considerations & Downstream Hardening
 
-As an educational starter template, several production hardening considerations are left to downstream developers:
+### Built-In Security Controls
+
+* **Authorization Boundaries:** Fail-closed allowlists for users, guilds, and channels prevent unauthorized access to the operator's Sera account and OpenAI quota.
+* **DMs Disabled by Default:** DMs must be explicitly opted into via `DISCORD_ALLOW_DMS=true`. When enabled, user allowlists still apply.
+* **Mention Safety:** All bot replies suppress Discord mention parsing. LLM output cannot ping users, roles, or `@everyone`.
+* **History Isolation:** Bot responses in public channels are scoped by Discord message references, preventing cross-user context bleed.
+* **Execution Tools Disabled:** `SERA_ENABLE_EXECUTION_TOOLS=false` is pinned in the subprocess environment.
+* **External Signer Mode:** `SERA_SIGNER_MODE=external` is pinned — no private keys are held by the bot process.
+
+### Known Limitations
+
+* **Per-Process Rate Limiting:** Rate limiting is in-memory and per-process. It can be bypassed using multiple Discord accounts. For production use, consider a persistent rate limiter backed by Redis or similar.
+* **No Persistent Sessions:** Conversation history is fetched dynamically from Discord's API. Long conversations may lose context beyond the 15-message window.
+* **MCP Transport:** This template only supports stdio transport via `SERA_MCP_DIST`. For Streamable HTTP transport (`SERA_MCP_URL`), use the `chat-cli`, `web-chat`, or `webhook-agent` templates instead.
+
+### Downstream Hardening
 
 * **Subprocess Security:** The bot launches `sera-mcp` as a stdio subprocess. The hosting environment must ensure that the user executing the bot process has restricted filesystem access to prevent the MCP runtime from interacting with root filesystem segments.
 * **Intents Minimum Boundary:** Limit the bot to the minimal permissions scope. Do **not** assign the `Administrator` permission to the bot role in Discord.
@@ -155,3 +191,6 @@ As an educational starter template, several production hardening considerations 
 * **Permission Errors (`DiscordAPIError[50013]`):** 
   * *Cause:* The bot role is missing permission to post in specific threads or read channel histories. 
   * *Resolution:* Regenerate the invite link with the exact scopes specified in the portal setup section above.
+* **Bot refuses to start with allowlist error:**
+  * *Cause:* `SERA_API_KEY` or `SERA_API_SECRET` is set without any authorization allowlist.
+  * *Resolution:* Configure at least one of `DISCORD_ALLOWED_USER_IDS`, `DISCORD_ALLOWED_GUILD_IDS`, or `DISCORD_ALLOWED_CHANNEL_IDS`.

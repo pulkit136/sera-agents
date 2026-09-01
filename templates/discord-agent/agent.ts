@@ -6,6 +6,7 @@
  * in-memory rate limiting, concurrency cap slots, and premium embeds for financial summaries.
  * All functions are encapsulated in a single file per repository template conventions.
  */
+import "dotenv/config";
 import { Agent, assistant, MCPServerStdio, run, user } from "@openai/agents";
 import {
   ActivityType,
@@ -13,12 +14,14 @@ import {
   Client,
   EmbedBuilder,
   GatewayIntentBits,
+  type Message,
+  type MessageReplyOptions,
   Partials,
   type TextBasedChannel,
 } from "discord.js";
 
 // ── 1. LOGGING & UTILITIES ───────────────────────────────────────────────────
-function logEvent(event: string, meta: Record<string, unknown> = {}) {
+export function logEvent(event: string, meta: Record<string, unknown> = {}) {
   const logObj = {
     timestamp: new Date().toISOString(),
     event,
@@ -41,18 +44,99 @@ Operating principles:
 - Default to simulate:true on get_quote when the user is exploring.
 - For execution, return the route_params + uuid. Format structured outputs (quotes, balances, built transactions) as standard JSON blocks within \`\`\`json ... \`\`\` so the bot can format them into premium Discord embeds.
 - Be concise. Show numbers with sensible precision. Skip filler.
+- NEVER mention @everyone, @here, or any user/role by ID. Output plain text names only.
 `.trim();
 
 // Cached regular expressions to avoid dynamic compilation overhead
 const JSON_BLOCK_REGEX = /```json\s*([\s\S]*?)\s*```/;
 let mentionRegex: RegExp;
 
-// ── 3. IN-MEMORY RATE LIMITING ───────────────────────────────────────────────
+/** Safe reply options that suppress all Discord mentions from LLM output. */
+const SAFE_REPLY_OPTIONS: Pick<MessageReplyOptions, "allowedMentions"> = {
+  allowedMentions: { parse: [], repliedUser: false },
+};
+
+// ── 3. AUTHORIZATION BOUNDARIES ──────────────────────────────────────────────
+
+/**
+ * Parse a comma-separated environment variable into a Set.
+ * Returns null if the variable is unset or empty (meaning "no restriction").
+ */
+export function parseAllowlist(envValue: string | undefined): Set<string> | null {
+  if (!envValue || envValue.trim() === "") return null;
+  const ids = envValue
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return ids.length > 0 ? new Set(ids) : null;
+}
+
+export interface AuthConfig {
+  allowedUsers: Set<string> | null;
+  allowedGuilds: Set<string> | null;
+  allowedChannels: Set<string> | null;
+  allowDMs: boolean;
+}
+
+export function loadAuthConfig(): AuthConfig {
+  return {
+    allowedUsers: parseAllowlist(process.env.DISCORD_ALLOWED_USER_IDS),
+    allowedGuilds: parseAllowlist(process.env.DISCORD_ALLOWED_GUILD_IDS),
+    allowedChannels: parseAllowlist(process.env.DISCORD_ALLOWED_CHANNEL_IDS),
+    allowDMs: process.env.DISCORD_ALLOW_DMS === "true",
+  };
+}
+
+export interface AuthContext {
+  userId: string;
+  guildId: string | null;
+  channelId: string;
+  isDM: boolean;
+}
+
+/**
+ * Check whether a message is authorized. Returns null if allowed,
+ * or a reason string if denied (fail-closed).
+ */
+export function checkAuthorization(config: AuthConfig, ctx: AuthContext): string | null {
+  // DM authorization
+  if (ctx.isDM) {
+    if (!config.allowDMs) {
+      return "dm_disabled";
+    }
+    // In DMs, only check user allowlist (no guild/channel to check)
+    if (config.allowedUsers && !config.allowedUsers.has(ctx.userId)) {
+      return "user_not_allowed";
+    }
+    return null;
+  }
+
+  // Guild authorization
+  if (config.allowedGuilds && ctx.guildId && !config.allowedGuilds.has(ctx.guildId)) {
+    return "guild_not_allowed";
+  }
+
+  // Channel authorization
+  if (config.allowedChannels && !config.allowedChannels.has(ctx.channelId)) {
+    return "channel_not_allowed";
+  }
+
+  // User authorization
+  if (config.allowedUsers && !config.allowedUsers.has(ctx.userId)) {
+    return "user_not_allowed";
+  }
+
+  return null;
+}
+
+// ── 4. IN-MEMORY RATE LIMITING ───────────────────────────────────────────────
 const rateLimits = new Map<string, { count: number; start: number }>();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
+/** Interval between stale-entry eviction sweeps. */
+const RATE_LIMIT_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 
-function isRateLimited(userId: string): boolean {
+export function isRateLimited(userId: string): boolean {
   const now = Date.now();
   const limit = rateLimits.get(userId);
   if (!limit || now - limit.start > RATE_LIMIT_WINDOW_MS) {
@@ -63,8 +147,44 @@ function isRateLimited(userId: string): boolean {
   return limit.count > RATE_LIMIT_MAX_REQUESTS;
 }
 
-// ── 4. CONCURRENCY SLOTS ─────────────────────────────────────────────────────
-const MAX_CONCURRENT = Number(process.env.DISCORD_MAX_CONCURRENT ?? 4);
+/**
+ * Evict rate-limit entries whose window has expired.
+ * Prevents unbounded Map growth from inactive users.
+ */
+export function evictStaleRateLimits(): number {
+  const now = Date.now();
+  let evicted = 0;
+  for (const [userId, entry] of rateLimits) {
+    if (now - entry.start > RATE_LIMIT_WINDOW_MS) {
+      rateLimits.delete(userId);
+      evicted++;
+    }
+  }
+  return evicted;
+}
+
+// ── 5. CONCURRENCY SLOTS ─────────────────────────────────────────────────────
+
+/**
+ * Parse and validate the concurrency cap from an environment variable.
+ * Returns a safe positive integer, falling back to the provided default
+ * when the input is missing, non-numeric, or non-positive.
+ */
+export function parseMaxConcurrent(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    logEvent("invalid_max_concurrent", {
+      raw,
+      reason: "Non-numeric, non-positive, or non-integer value; using default",
+      fallback,
+    });
+    return fallback;
+  }
+  return parsed;
+}
+
+const MAX_CONCURRENT = parseMaxConcurrent(process.env.DISCORD_MAX_CONCURRENT, 4);
 let activeRuns = 0;
 
 async function withSlot<T>(fn: () => Promise<T>): Promise<T | null> {
@@ -77,8 +197,8 @@ async function withSlot<T>(fn: () => Promise<T>): Promise<T | null> {
   }
 }
 
-// ── 5. UX HELPERS ────────────────────────────────────────────────────────────
-function splitMessage(text: string, maxLength: number = 2000): string[] {
+// ── 6. UX HELPERS ────────────────────────────────────────────────────────────
+export function splitMessage(text: string, maxLength: number = 2000): string[] {
   if (text.length <= maxLength) return [text];
   const chunks: string[] = [];
   let cur = text;
@@ -96,7 +216,7 @@ function splitMessage(text: string, maxLength: number = 2000): string[] {
   return chunks;
 }
 
-function tryFormatEmbed(text: string): { embed: EmbedBuilder | null; cleanText: string } {
+export function tryFormatEmbed(text: string): { embed: EmbedBuilder | null; cleanText: string } {
   const match = text.match(JSON_BLOCK_REGEX);
   if (!match) return { embed: null, cleanText: text };
 
@@ -179,7 +299,7 @@ function tryFormatEmbed(text: string): { embed: EmbedBuilder | null; cleanText: 
   return { embed: null, cleanText: text };
 }
 
-// ── 6. BOOTSTRAP MAIN LOOP ───────────────────────────────────────────────────
+// ── 7. BOOTSTRAP MAIN LOOP ───────────────────────────────────────────────────
 async function main() {
   const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
   const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -204,10 +324,36 @@ async function main() {
     throw new Error("SERA_MCP_DIST is required");
   }
 
+  // Load authorization config
+  const authConfig = loadAuthConfig();
+
+  // Require at least one authorization boundary when Sera API credentials are present
+  const hasApiCredentials = !!(process.env.SERA_API_KEY || process.env.SERA_API_SECRET);
+  const hasAnyAllowlist =
+    authConfig.allowedUsers !== null ||
+    authConfig.allowedGuilds !== null ||
+    authConfig.allowedChannels !== null;
+
+  if (hasApiCredentials && !hasAnyAllowlist) {
+    logEvent("startup_failed", {
+      reason:
+        "SERA_API_KEY or SERA_API_SECRET is set but no authorization allowlist is configured. " +
+        "Set at least one of DISCORD_ALLOWED_USER_IDS, DISCORD_ALLOWED_GUILD_IDS, or " +
+        "DISCORD_ALLOWED_CHANNEL_IDS to restrict access to your Sera account.",
+    });
+    process.exit(1);
+  }
+
   logEvent("startup", {
     mcpPath: seraMcpPath,
     network: process.env.SERA_NETWORK ?? "mainnet",
     maxConcurrent: MAX_CONCURRENT,
+    allowDMs: authConfig.allowDMs,
+    hasUserAllowlist: authConfig.allowedUsers !== null,
+    hasGuildAllowlist: authConfig.allowedGuilds !== null,
+    hasChannelAllowlist: authConfig.allowedChannels !== null,
+    // Note: rate limiting is per-process and can be bypassed using multiple accounts.
+    rateLimitNote: "per-process; bypassable via multiple Discord accounts",
   });
 
   // Setup MCP Subprocess stdio daemon
@@ -253,10 +399,19 @@ async function main() {
     partials: [Partials.Channel, Partials.Message],
   });
 
-  // Dynamic context history retriever
+  // Start periodic rate-limit cleanup
+  const rateLimitCleanupTimer = setInterval(() => {
+    const evicted = evictStaleRateLimits();
+    if (evicted > 0) {
+      logEvent("rate_limit_cleanup", { evicted });
+    }
+  }, RATE_LIMIT_CLEANUP_INTERVAL_MS);
+
+  // Dynamic context history retriever — scoped to prevent cross-user context bleed
   async function fetchHistory(
     channel: TextBasedChannel,
     authorId: string,
+    botUserId: string,
     limit = 15,
     excludeMessageId?: string,
   ): Promise<Array<ReturnType<typeof user> | ReturnType<typeof assistant>>> {
@@ -268,12 +423,29 @@ async function main() {
       const isDM = channel.type === ChannelType.DM;
       const isThread = channel.isThread();
 
+      // Build a Set of message IDs authored by the current user for reference checking
+      const currentUserMessageIds = new Set<string>();
+      for (const msg of sorted) {
+        if (msg.author.id === authorId) {
+          currentUserMessageIds.add(msg.id);
+        }
+      }
+
       for (const msg of sorted) {
         if (excludeMessageId && msg.id === excludeMessageId) {
           continue;
         }
         if (msg.author.bot) {
-          if (msg.author.id === client.user?.id) {
+          if (msg.author.id === botUserId) {
+            // Only include bot messages that were direct replies to the current user.
+            // This prevents cross-user context bleed in public channels.
+            if (!isDM && !isThread) {
+              const replyToId = msg.reference?.messageId;
+              if (!replyToId || !currentUserMessageIds.has(replyToId)) {
+                continue;
+              }
+            }
+
             let content = msg.content || "";
             if (msg.embeds.length > 0) {
               for (const embed of msg.embeds) {
@@ -281,7 +453,7 @@ async function main() {
                 for (const field of embed.fields) {
                   content += `${field.name}: ${field.value}\n`;
                 }
-                content += `]`;
+                content += "]";
               }
             }
             if (content.trim()) {
@@ -289,7 +461,7 @@ async function main() {
             }
           }
         } else {
-          // Context rules: normal channels only load messages from "that conversation" (the specific participant)
+          // Context rules: normal channels only load messages from the specific participant
           if (!isDM && !isThread && msg.author.id !== authorId) {
             continue;
           }
@@ -306,6 +478,17 @@ async function main() {
       logEvent("history_fetch_failed", { error: errorMsg });
       return [];
     }
+  }
+
+  /** Send a safe reply that suppresses all mention parsing. */
+  async function safeReply(
+    message: Message,
+    content: string | MessageReplyOptions,
+  ): Promise<Message> {
+    if (typeof content === "string") {
+      return message.reply({ content, ...SAFE_REPLY_OPTIONS });
+    }
+    return message.reply({ ...content, ...SAFE_REPLY_OPTIONS });
   }
 
   // Gateway Ready Handlers
@@ -372,6 +555,27 @@ async function main() {
 
     if (!isDM && !isMentioned) return;
 
+    const authCtx: AuthContext = {
+      userId: message.author.id,
+      guildId: message.guildId,
+      channelId: message.channel.id,
+      isDM,
+    };
+
+    // Authorization check — fail-closed
+    const authDenied = checkAuthorization(authConfig, authCtx);
+    if (authDenied) {
+      logEvent("authorization_denied", {
+        reason: authDenied,
+        authorId: message.author.id,
+        guildId: message.guildId,
+        channelId: message.channel.id,
+        isDM,
+      });
+      // Silent reject — do not reveal authorization boundaries to unauthorized users
+      return;
+    }
+
     logEvent("incoming_interaction", {
       type: "message",
       authorId: message.author.id,
@@ -383,7 +587,8 @@ async function main() {
 
     if (userPrompt.length === 0 && !isDM) {
       logEvent("empty_mention_warning", { authorId: message.author.id });
-      await message.reply(
+      await safeReply(
+        message,
         "I received your mention, but the message content was blank. " +
           "Please check that the bot has **Message Content Intent** enabled in the Discord Developer Portal.",
       );
@@ -393,7 +598,8 @@ async function main() {
     // Rate limiter
     if (isRateLimited(message.author.id)) {
       logEvent("rate_limit_exceeded", { authorId: message.author.id });
-      await message.reply(
+      await safeReply(
+        message,
         "You are sending messages too quickly! Please wait a moment before trying again.",
       );
       return;
@@ -412,7 +618,14 @@ async function main() {
 
       try {
         // Reconstruct Context: threads/DMs fetch recent history, standard channels fetch only current user history
-        const history = await fetchHistory(message.channel, message.author.id, 15, message.id);
+        const botUserId = client.user?.id ?? "";
+        const history = await fetchHistory(
+          message.channel,
+          message.author.id,
+          botUserId,
+          15,
+          message.id,
+        );
 
         // Ensure the current user prompt is included in the history for this execution run
         history.push(user(userPrompt));
@@ -427,17 +640,17 @@ async function main() {
         // Split responses if exceeding Discord limits
         const messageChunks = splitMessage(cleanText);
 
-        // Send standard text chunks
+        // Send standard text chunks with mention safety
         for (let i = 0; i < messageChunks.length; i++) {
           const text = messageChunks[i];
           if (text) {
-            await message.reply(text);
+            await safeReply(message, text);
           }
         }
 
-        // Send the embed card if present
+        // Send the embed card if present, with mention safety
         if (embed) {
-          await message.reply({ embeds: [embed] });
+          await safeReply(message, { embeds: [embed] });
         }
 
         const durationMs = Date.now() - startExecution;
@@ -454,7 +667,8 @@ async function main() {
           durationMs,
           error: errorMsg,
         });
-        await message.reply(
+        await safeReply(
+          message,
           "Sorry, an error occurred while processing your request. Please try again later.",
         );
       }
@@ -462,7 +676,8 @@ async function main() {
 
     if (slotAcquired === null) {
       logEvent("concurrency_slot_unavailable", { authorId: message.author.id });
-      await message.reply(
+      await safeReply(
+        message,
         "I am currently busy handling other requests. Please try again in a few seconds.",
       );
     }
@@ -471,6 +686,7 @@ async function main() {
   // Graceful shutdown procedures
   const shutdown = async (signal: string) => {
     logEvent("shutdown", { signal });
+    clearInterval(rateLimitCleanupTimer);
     try {
       await sera.close();
     } catch (err: unknown) {
@@ -494,7 +710,14 @@ async function main() {
   }
 }
 
-main().catch((err: unknown) => {
-  logEvent("fatal_startup_error", { error: err instanceof Error ? err.message : String(err) });
-  process.exit(1);
-});
+// Only run when this file is the entry point (not when imported by tests)
+const isMainModule =
+  process.argv[1] &&
+  import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/").replace(/^(?!\/)/, "/"));
+
+if (isMainModule || process.env.SERA_RUN_MAIN === "true") {
+  main().catch((err: unknown) => {
+    logEvent("fatal_startup_error", { error: err instanceof Error ? err.message : String(err) });
+    process.exit(1);
+  });
+}

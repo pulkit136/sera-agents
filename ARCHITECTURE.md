@@ -141,7 +141,7 @@ External — uses `sera-mcp` directly, no code in this repo. See `README.md` Pat
 
 - A single-file `agent.ts` or `server.ts` (the entire template body).
 - Uses [`@openai/agents`](https://www.npmjs.com/package/@openai/agents) (the OpenAI Agents SDK for JS/TS).
-- Defaults to a local `sera-mcp` stdio subprocess via `MCPServerStdio`; setting `SERA_MCP_URL` selects `MCPServerStreamableHttp` instead. When that endpoint needs Bearer authentication, `SERA_MCP_TOKEN` is sent only as its `Authorization` header.
+- Defaults to a local `sera-mcp` stdio subprocess via `MCPServerStdio`. Three templates (`chat-cli`, `web-chat`, `webhook-agent`) additionally support Streamable HTTP: setting `SERA_MCP_URL` selects `MCPServerStreamableHttp` instead. When that endpoint needs Bearer authentication, `SERA_MCP_TOKEN` is sent only as its `Authorization` header. The remaining templates (`discord-agent`, `slack-agent`, `market-maker`, `withdraw-cli`) are stdio-only and require `SERA_MCP_DIST`.
 - Defines a system prompt + agent role; the agent decides which `sera.*` tools to call.
 
 Each template exposes one shape:
